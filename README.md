@@ -21,7 +21,7 @@ Windows 托盘实时 Ping 监控工具，在任务栏显示 Ping 延迟数值和
 
 ```bash
 # 克隆项目
-git clone <your-repo-url>
+git clone https://github.com/gitdpi/PingMonitor.git
 cd ping
 
 # 安装依赖
