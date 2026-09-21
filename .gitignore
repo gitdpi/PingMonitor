@@ -11,6 +11,7 @@ dist/
 
 # PyInstaller
 *.spec
+!PingMonitor.spec
 _pyinstaller_deps/
 
 # Virtual environments
