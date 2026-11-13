@@ -1,9 +1,12 @@
 import ctypes
 import json
 import os
+import statistics
 import sys
 import threading
+import time
 import tkinter as tk
+from collections import deque
 from tkinter import messagebox
 
 from PIL import Image, ImageDraw, ImageFont
@@ -11,6 +14,11 @@ from pystray import Icon, Menu, MenuItem
 from ping3 import ping
 
 from taskbar_widget import TaskbarWidget
+
+try:
+    import winreg
+except ImportError:  # 非 Windows 平台
+    winreg = None
 
 
 def _get_app_dir():
@@ -34,17 +42,60 @@ def enable_dpi_awareness():
 
 CONFIG_FILE = os.path.join(_get_app_dir(), "config.json")
 
+DEFAULT_CONFIG = {
+    "target": "8.8.8.8",
+    "interval": 1,
+    "timeout": 2,
+    "show_in_taskbar": True,
+    # 颜色阈值（毫秒）：≤good 绿、≤fair 黄、>fair 红。
+    # 100ms 当红线对公网目标太严，默认放宽到 80/150；内网目标可改成 20/50 之类。
+    "thresholds": {"good": 80, "fair": 150},
+}
+
+SAMPLE_WINDOW = 3  # 用最近 3 次采样的中位数判色，避免单次抖动导致红黄横跳
+
 
 def load_config():
-    default = {"target": "8.8.8.8", "interval": 1, "timeout": 2, "show_in_taskbar": True}
+    config = {**DEFAULT_CONFIG, "thresholds": dict(DEFAULT_CONFIG["thresholds"])}
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                config = json.load(f)
-                return {**default, **config}
+                saved = json.load(f)
         except (json.JSONDecodeError, IOError):
-            pass
-    return default
+            saved = None
+        if isinstance(saved, dict):
+            thresholds = saved.pop("thresholds", None)
+            config.update(saved)
+            if isinstance(thresholds, dict):
+                config["thresholds"].update(thresholds)
+    good, fair = normalize_thresholds(config["thresholds"])
+    config["thresholds"] = {"good": good, "fair": fair}
+    return config
+
+
+def normalize_thresholds(raw):
+    """校验阈值：必须是正数且 good < fair，否则整体退回默认值。"""
+    good_default = DEFAULT_CONFIG["thresholds"]["good"]
+    fair_default = DEFAULT_CONFIG["thresholds"]["fair"]
+
+    def _num(name, value, fallback):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            print(f"配置里的颜色阈值 {name}={value!r} 不是数字，已用默认值 {fallback}")
+            return float(fallback)
+        if number <= 0:
+            print(f"配置里的颜色阈值 {name}={value!r} 必须是正数，已用默认值 {fallback}")
+            return float(fallback)
+        return number
+
+    good = _num("good", raw.get("good"), good_default)
+    fair = _num("fair", raw.get("fair"), fair_default)
+    if good >= fair:
+        print(f"配置里的颜色阈值不合理 (good={good:g}, fair={fair:g})，"
+              f"已退回默认 {good_default}/{fair_default}")
+        return float(good_default), float(fair_default)
+    return good, fair
 
 
 def save_config(config):
@@ -55,14 +106,80 @@ def save_config(config):
         print(f"Failed to save config: {e}")
 
 
-def get_color(latency_ms):
-    if latency_ms is None:
-        return (128, 128, 128)
-    if latency_ms <= 50:
-        return (34, 197, 94)
-    if latency_ms <= 100:
-        return (234, 179, 8)
-    return (239, 68, 68)
+# 状态：还没测到 / 绿 / 黄 / 红 / 全部超时
+UNKNOWN, GOOD, FAIR, BAD, DOWN = "unknown", "good", "fair", "bad", "down"
+
+# 托盘图标是"色块 + 数字"，底色由色块自带，文字另按亮度自动选黑/白
+_ICON_COLORS = {
+    GOOD: (34, 197, 94),       # #22C55E
+    FAIR: (234, 179, 8),       # #EAB308
+    BAD: (220, 38, 38),        # #DC2626（白字 4.8:1，原来的 #EF4444 只有 3.8:1）
+    UNKNOWN: (107, 114, 128),  # #6B7280（白字 4.8:1）
+}
+
+# 任务栏挂件是"透明背景 + 彩色文字"，文字对比度完全取决于任务栏底色，
+# 所以浅色任务栏要换一套深一档的颜色（注释里是对应底色下的对比度）。
+_WIDGET_COLORS = {
+    "dark": {   # 深色任务栏（约 #1F1F1F）
+        GOOD: (34, 197, 94),       # #22C55E  7.2:1
+        FAIR: (234, 179, 8),       # #EAB308  8.6:1
+        BAD: (240, 82, 82),        # #F05252  4.7:1（#EF4444 只有 4.4:1）
+        UNKNOWN: (156, 163, 175),  # #9CA3AF  6.5:1
+    },
+    "light": {  # 浅色任务栏（约 #F3F3F3）
+        GOOD: (22, 101, 52),       # #166534  6.4:1
+        FAIR: (133, 77, 14),       # #854D0E  6.2:1
+        BAD: (185, 28, 28),        # #B91C1C  5.8:1
+        UNKNOWN: (75, 85, 99),     # #4B5563  6.8:1
+    },
+}
+
+
+def level_of(latency_ms, thresholds):
+    """按阈值把延迟值映射到颜色档位。"""
+    good, fair = thresholds
+    if latency_ms <= good:
+        return GOOD
+    if latency_ms <= fair:
+        return FAIR
+    return BAD
+
+
+def icon_color(state):
+    # "全部超时"用红色而不是灰色：最严重的状态不该是最不显眼的颜色
+    return _ICON_COLORS[BAD if state == DOWN else state]
+
+
+def widget_color(state):
+    palette = _WIDGET_COLORS["light" if taskbar_is_light() else "dark"]
+    return palette[BAD if state == DOWN else state]
+
+
+def thresholds_text(thresholds):
+    good, fair = thresholds
+    return f"颜色规则: ≤{good:g} 绿 / ≤{fair:g} 黄 / >{fair:g} 红"
+
+
+_theme_cache = {"checked_at": -999.0, "light": False}
+_THEME_TTL = 5.0
+
+
+def taskbar_is_light():
+    """任务栏当前是不是浅色主题（结果缓存 5 秒，不必每轮都读注册表）。"""
+    now = time.monotonic()
+    if now - _theme_cache["checked_at"] < _THEME_TTL:
+        return _theme_cache["light"]
+    light = False
+    if winreg is not None:
+        try:
+            with winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as key:
+                light = bool(winreg.QueryValueEx(key, "SystemUsesLightTheme")[0])
+        except OSError:
+            light = False  # 读不到就按深色任务栏处理
+    _theme_cache.update(checked_at=now, light=light)
+    return light
 
 
 def pick_text_color(rgb):
@@ -80,15 +197,73 @@ def format_latency(latency_ms, placeholder="--"):
     return str(int(latency_ms))
 
 
-def generate_icon(latency_ms):
+def widget_text(state, latency_ms):
+    """挂件文本。挂件字体是 Arial，不能用中文（会缺字）。"""
+    if state == UNKNOWN:
+        return "--"
+    if state == DOWN:
+        return "×"
+    return format_latency(latency_ms)
+
+
+def icon_text(state, latency_ms):
+    if state == UNKNOWN:
+        return "?"
+    if state == DOWN:
+        return "×"
+    return format_latency(latency_ms, "?")
+
+
+def status_text(state, latency_ms, lost, total):
+    """托盘菜单/提示里的一句话状态。"""
+    if state == UNKNOWN:
+        return "等待测量"
+    if state == DOWN:
+        return f"超时/无响应（丢包 {total}/{total}）"
+    text = f"{int(latency_ms)} ms"
+    if lost:
+        text += f" · 丢包 {lost}/{total}"
+    return text
+
+
+def probe(target, timeout):
+    """测一次 RTT。ping3 用 False 表示解析失败等错误、None 表示超时，统一转成 None。"""
+    try:
+        value = ping(target, timeout=timeout, unit="ms")
+    except Exception as e:
+        print(f"Ping error: {e}")
+        return None
+    if value is None or isinstance(value, bool) or value <= 0:
+        return None
+    return float(value)
+
+
+def summarize(history, thresholds):
+    """把最近几次采样归纳成 (状态, 显示用延迟, 丢包数, 采样数)。"""
+    samples = list(history)
+    if not samples:
+        return UNKNOWN, None, 0, 0
+    measured = [v for v in samples if v is not None]
+    lost = len(samples) - len(measured)
+    if not measured:
+        return DOWN, None, lost, len(samples)
+    median = statistics.median(measured)
+    state = level_of(median, thresholds)
+    if lost:
+        # 有丢包就至少黄：丢包的链路和"只是慢"的链路不是一回事
+        state = BAD if lost >= 2 else (FAIR if state == GOOD else state)
+    return state, median, lost, len(samples)
+
+
+def generate_icon(state, latency_ms):
     size = 128
-    color = get_color(latency_ms)
+    color = icon_color(state)
 
     img = Image.new("RGB", (size, size), color)
     draw = ImageDraw.Draw(img)
 
-    text = format_latency(latency_ms, "?")
-    if latency_ms is None:
+    text = icon_text(state, latency_ms)
+    if state == UNKNOWN:
         font_size = 100
     elif len(text) >= 4:
         font_size = 48
@@ -125,19 +300,22 @@ class PingTrayMonitor:
         self.icon = Icon("Ping Monitor")
         self.stop_event = threading.Event()
         self.current_latency = None
+        self.state = UNKNOWN
+        self.loss = (0, 0)
 
         self._tk_root = None
         self._dialog = None
         self.taskbar_widget = None
 
-        self.icon.icon = generate_icon(None)
+        self.icon.icon = generate_icon(UNKNOWN, None)
         self.icon.title = f"Ping Monitor - {self.config['target']}"
         self.icon.menu = Menu(
             MenuItem("设置目标地址...", self.open_settings, default=True),
             MenuItem("在任务栏显示数值", self.toggle_taskbar, checked=self._taskbar_checked),
             MenuItem(Menu.SEPARATOR, None, enabled=False),
             MenuItem(f"当前目标: {self.config['target']}", None, enabled=False),
-            MenuItem("Ping 间隔: 1s", None, enabled=False),
+            MenuItem(f"Ping 间隔: {self.config.get('interval', 1)}s", None, enabled=False),
+            MenuItem(thresholds_text(self._thresholds()), None, enabled=False),
             MenuItem(Menu.SEPARATOR, None, enabled=False),
             MenuItem("退出", self.quit),
         )
@@ -172,11 +350,18 @@ class PingTrayMonitor:
             return
         widget.set_enabled(enabled)
 
+    def _thresholds(self):
+        with self.config_lock:
+            thresholds = self.config.get("thresholds") or {}
+        return (thresholds.get("good", DEFAULT_CONFIG["thresholds"]["good"]),
+                thresholds.get("fair", DEFAULT_CONFIG["thresholds"]["fair"]))
+
     def _update_taskbar(self):
         widget = self.taskbar_widget
         if widget is None:
             return
-        widget.update(format_latency(self.current_latency), get_color(self.current_latency))
+        state = self.state
+        widget.update(widget_text(state, self.current_latency), widget_color(state))
 
     def _get_target(self):
         with self.config_lock:
@@ -252,31 +437,40 @@ class PingTrayMonitor:
         self._tk_root.after(0, lambda: self._open_dialog(target))
 
     def update_ping(self):
+        history = deque(maxlen=SAMPLE_WINDOW)
+        last_target = None
         while not self.stop_event.is_set():
-            try:
-                target = self._get_target()
-                latency = ping(target, timeout=self.config.get("timeout", 2), unit="ms")
-                self.current_latency = latency
-            except Exception as e:
-                print(f"Ping error: {e}")
-                self.current_latency = None
+            target = self._get_target()
+            if target != last_target:
+                history.clear()  # 换了目标，旧样本没有参考价值
+                last_target = target
 
-            self.icon.icon = generate_icon(self.current_latency)
+            timeout = self.config.get("timeout", 2)
+            history.append(probe(target, timeout))
+            state, latency, lost, total = summarize(history, self._thresholds())
+            self.state = state
+            self.current_latency = latency
+            self.loss = (lost, total)
 
-            if self.current_latency is None:
-                title = "Ping Monitor - 超时/错误"
+            self.icon.icon = generate_icon(state, latency)
+
+            if state == UNKNOWN:
+                title = "Ping Monitor - 等待测量"
+            elif state == DOWN:
+                title = "Ping Monitor - 超时/无响应"
             else:
-                title = f"Ping Monitor - {int(self.current_latency)} ms"
+                title = f"Ping Monitor - {int(latency)} ms"
             self.icon.title = title
 
-            target = self._get_target()
-            latency_text = "超时" if self.current_latency is None else f"{int(self.current_latency)} ms"
+            latency_text = status_text(state, latency, lost, total)
             self.icon.menu = Menu(
                 MenuItem("设置目标地址...", self.open_settings, default=True),
                 MenuItem("在任务栏显示数值", self.toggle_taskbar, checked=self._taskbar_checked),
                 MenuItem(Menu.SEPARATOR, None, enabled=False),
                 MenuItem(f"当前目标: {target}", None, enabled=False),
                 MenuItem(f"延迟: {latency_text}", None, enabled=False),
+                MenuItem(f"Ping 间隔: {self.config.get('interval', 1)}s", None, enabled=False),
+                MenuItem(thresholds_text(self._thresholds()), None, enabled=False),
                 MenuItem(Menu.SEPARATOR, None, enabled=False),
                 MenuItem("退出", self.quit),
             )

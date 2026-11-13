@@ -35,3 +35,6 @@ config.json
 
 # Logs
 *.log
+
+# 权限诊断脚本留下的备份/回滚文件（诊断时的工作区 ACL 报告）
+_acl-reports/
