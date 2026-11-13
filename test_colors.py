@@ -398,6 +398,10 @@ class CenterGeometryTests(unittest.TestCase):
     def test_never_goes_negative(self):
         self.assertEqual(m.center_geometry((800, 600), (900, 700)), "900x700+0+0")
 
+    def test_center_position(self):
+        self.assertEqual(m.center_position((1920, 1080), (432, 327)), (744, 376))
+        self.assertEqual(m.center_position((800, 600), (900, 700)), (0, 0))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

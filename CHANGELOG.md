@@ -14,20 +14,24 @@
   目标/间隔/超时/阈值由 Ping 循环逐轮读取，下一轮自动生效；挂件开关立刻 `set_enabled`
 - 托盘菜单项 "设置目标地址..." 改为 "设置..."，与实际功能一致
 
-**弹框居中**（`main.py`）
+**弹框居中**（`main.py`、`taskbar_widget.py`）
 
-- 原本是写死的 `geometry("340x170")`（左上角定位），内容一多就会跑偏；现在按窗口自身的
-  `winfo_reqwidth/reqheight` 算居中位置（`center_geometry()` / `center_window()`），
-  窗口比屏幕还大时钳到 `+0+0`
+- 原本是写死的 `geometry("340x170")`（左上角定位），内容一多就会跑偏；现在先按客户区尺寸定身、
+  再量外框（新增 `taskbar_widget.frame_rect()`），用**外框**尺寸算居中位置
+  （`center_position()` / `center_window()`），窗口比屏幕还大时钳到 `+0+0`
+- 坑：Tk 的 `geometry("WxH+X+Y")` 里 X/Y 定位的是**外框**左上角，而 WxH 是**客户区**尺寸。
+  按客户区尺寸居中会让整个窗口偏右下（125% 缩放下实测偏 9px/24px），所以必须量外框；
+  `winfo_id()` 给的是客户区句柄，要 `GetAncestor(..., GA_ROOT)` 才是外框
 - 支持 `Esc` 取消、`Enter` 保存
 
 ### 测试
 
-- `test_colors.py` 从 38 项扩到 54 项：新增 `parse_settings` 的 10 个校验分支、
-  `number_text`/`tidy_number` 的数值显示、`center_geometry` 的居中与钳零
-- 真实弹框集成验证（1536×864 屏幕）：350×256 的窗口落在 `(593,304)` 即正中；
-  5 个输入框预填当前配置、勾选状态正确；保存后 `config.json` 五个键全部更新、
-  取消勾选后挂件被立刻关闭、Ping 循环切到新目标（127.0.0.1 → 0.28ms）
+- `test_colors.py` 从 38 项扩到 55 项：新增 `parse_settings` 的 10 个校验分支、
+  `number_text`/`tidy_number` 的数值显示、`center_position`/`center_geometry` 的居中与钳零
+- 真实弹框集成验证（125% 缩放屏，物理 1920×1080）：外框 432×327 落在 `(744,376)` 即正中
+  （按客户区算的旧做法会落在 `(753,400)`）；5 个输入框预填当前配置、勾选状态正确；
+  保存后 `config.json` 五个键全部更新、取消勾选后挂件被立刻关闭、
+  Ping 循环切到新目标（127.0.0.1 → 0.28ms）
 
 ## 2026-11-13 · 颜色判定重做：阈值可配置、中位数抗抖、浅色任务栏适配
 

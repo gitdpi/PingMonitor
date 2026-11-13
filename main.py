@@ -14,7 +14,7 @@ from PIL import Image, ImageDraw, ImageFont
 from pystray import Icon, Menu, MenuItem
 from ping3 import ping
 
-from taskbar_widget import TaskbarWidget
+from taskbar_widget import TaskbarWidget, frame_rect
 
 try:
     import winreg
@@ -296,20 +296,46 @@ def parse_settings(target, interval_text, timeout_text, good_text, fair_text, sh
     }, None
 
 
-def center_geometry(screen_size, window_size):
-    """算出让窗口位于屏幕正中的 geometry 字符串。"""
+def center_position(screen_size, window_size):
+    """让 window_size 大小的窗口居中的左上角坐标。"""
     screen_w, screen_h = screen_size
     win_w, win_h = window_size
     x = max(0, (screen_w - win_w) // 2)
     y = max(0, (screen_h - win_h) // 2)
-    return f"{win_w}x{win_h}+{x}+{y}"
+    return x, y
+
+
+def center_geometry(screen_size, window_size):
+    """返回居中用的 geometry 字符串。"""
+    x, y = center_position(screen_size, window_size)
+    return f"{window_size[0]}x{window_size[1]}+{x}+{y}"
+
+
+def window_frame_size(win, fallback):
+    """窗口外框尺寸（含标题栏与边框）；量不到就用客户区尺寸兜底。"""
+    try:
+        rect = frame_rect(win.winfo_id())
+    except Exception:
+        return fallback
+    if rect is None:
+        return fallback
+    return rect.right - rect.left, rect.bottom - rect.top
 
 
 def center_window(win):
-    """按窗口自己请求的尺寸居中（调用前窗口内容要已经布局好）。"""
+    """把窗口连同标题栏和边框一起摆到屏幕正中。
+
+    Tk 的 geometry("WxH+X+Y") 中 X/Y 定位的是窗口外框左上角，而 WxH 是客户区尺寸，
+    所以先按客户区尺寸定身，量出外框，再用外框尺寸算居中位置。
+    """
     win.update_idletasks()
-    win.geometry(center_geometry((win.winfo_screenwidth(), win.winfo_screenheight()),
-                                 (win.winfo_reqwidth(), win.winfo_reqheight())))
+    client_w, client_h = win.winfo_reqwidth(), win.winfo_reqheight()
+    win.geometry(f"{client_w}x{client_h}")
+    win.update_idletasks()
+    frame_w, frame_h = window_frame_size(win, (client_w, client_h))
+    x, y = center_position((win.winfo_screenwidth(), win.winfo_screenheight()),
+                           (frame_w, frame_h))
+    win.geometry(f"{client_w}x{client_h}+{x}+{y}")
 
 
 def summarize(history, thresholds):

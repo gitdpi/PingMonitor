@@ -20,13 +20,14 @@ from ctypes import wintypes
 
 from PIL import Image, ImageDraw, ImageFont
 
-__all__ = ["TaskbarWidget"]
+__all__ = ["TaskbarWidget", "frame_rect"]
 
 _user32 = ctypes.windll.user32
 _gdi32 = ctypes.windll.gdi32
 _kernel32 = ctypes.windll.kernel32
 
 _GWL_EXSTYLE = -20
+_GA_ROOT = 2
 _GWLP_HWNDPARENT = -8
 _WS_EX_LAYERED = 0x00080000
 _WS_EX_TOOLWINDOW = 0x00000080
@@ -117,6 +118,8 @@ _user32.FindWindowExW.restype = wintypes.HWND
 _user32.FindWindowExW.argtypes = [wintypes.HWND, wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR]
 _user32.GetWindowRect.restype = wintypes.BOOL
 _user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(_RECT)]
+_user32.GetAncestor.restype = wintypes.HWND
+_user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
 _user32.GetForegroundWindow.restype = wintypes.HWND
 _user32.GetClassNameW.restype = ctypes.c_int
 _user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
@@ -160,6 +163,16 @@ def _window_rect(hwnd):
     if not hwnd or not _user32.GetWindowRect(hwnd, ctypes.byref(rect)):
         return None
     return rect
+
+
+def frame_rect(hwnd):
+    """窗口外框（含标题栏与边框）的矩形；句柄无效时返回 None。
+
+    Tk 的 geometry("WxH+X+Y") 里 X/Y 定位的是外框左上角、WxH 是客户区尺寸，
+    所以要把窗口（连标题栏一起）摆正，得先拿到外框尺寸。winfo_id() 给的是客户区句柄，
+    要往上取到根窗口才是外框。
+    """
+    return _window_rect(_user32.GetAncestor(hwnd, _GA_ROOT))
 
 
 def _class_name(hwnd):
