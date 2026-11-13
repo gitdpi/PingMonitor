@@ -1,5 +1,6 @@
 import ctypes
 import json
+import math
 import os
 import statistics
 import sys
@@ -238,6 +239,79 @@ def probe(target, timeout):
     return float(value)
 
 
+MIN_INTERVAL = 0.2  # 秒。间隔再小就等于连续发包了
+
+
+def number_text(value):
+    """配置里的数值 -> 输入框文本（1.0 显示成 "1"）。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if not math.isfinite(number):
+        return "0"
+    return str(int(number)) if number.is_integer() else f"{number:g}"
+
+
+def tidy_number(value):
+    """整数就存成整数，免得 config.json 里出现 1.0 这种写法。"""
+    return int(value) if float(value).is_integer() else value
+
+
+def parse_settings(target, interval_text, timeout_text, good_text, fair_text, show_in_taskbar):
+    """校验设置对话框的输入，返回 (配置字典, 错误信息)；两者只有一个不是 None。"""
+    target = str(target).strip()
+    if not target:
+        return None, "目标地址不能为空"
+
+    numbers = {}
+    for name, text in (("Ping 间隔", interval_text), ("超时时间", timeout_text),
+                      ("绿色阈值", good_text), ("黄色阈值", fair_text)):
+        try:
+            numbers[name] = float(str(text).strip())
+        except ValueError:
+            return None, f"{name}必须是数字"
+        if not math.isfinite(numbers[name]):
+            return None, f"{name}必须是有限的数字"
+
+    interval = numbers["Ping 间隔"]
+    timeout = numbers["超时时间"]
+    good = numbers["绿色阈值"]
+    fair = numbers["黄色阈值"]
+    if interval < MIN_INTERVAL:
+        return None, f"Ping 间隔不能小于 {MIN_INTERVAL:g} 秒"
+    if timeout <= 0:
+        return None, "超时时间必须大于 0"
+    if good <= 0 or fair <= 0:
+        return None, "颜色阈值必须是正数"
+    if good >= fair:
+        return None, "绿色阈值必须小于黄色阈值"
+
+    return {
+        "target": target,
+        "interval": tidy_number(interval),
+        "timeout": tidy_number(timeout),
+        "show_in_taskbar": bool(show_in_taskbar),
+        "thresholds": {"good": good, "fair": fair},
+    }, None
+
+
+def center_geometry(screen_size, window_size):
+    """算出让窗口位于屏幕正中的 geometry 字符串。"""
+    screen_w, screen_h = screen_size
+    win_w, win_h = window_size
+    x = max(0, (screen_w - win_w) // 2)
+    y = max(0, (screen_h - win_h) // 2)
+    return f"{win_w}x{win_h}+{x}+{y}"
+
+
+def center_window(win):
+    """按窗口自己请求的尺寸居中（调用前窗口内容要已经布局好）。"""
+    win.update_idletasks()
+    win.geometry(center_geometry((win.winfo_screenwidth(), win.winfo_screenheight()),
+                                 (win.winfo_reqwidth(), win.winfo_reqheight())))
+
+
 def summarize(history, thresholds):
     """把最近几次采样归纳成 (状态, 显示用延迟, 丢包数, 采样数)。"""
     samples = list(history)
@@ -310,7 +384,7 @@ class PingTrayMonitor:
         self.icon.icon = generate_icon(UNKNOWN, None)
         self.icon.title = f"Ping Monitor - {self.config['target']}"
         self.icon.menu = Menu(
-            MenuItem("设置目标地址...", self.open_settings, default=True),
+            MenuItem("设置...", self.open_settings, default=True),
             MenuItem("在任务栏显示数值", self.toggle_taskbar, checked=self._taskbar_checked),
             MenuItem(Menu.SEPARATOR, None, enabled=False),
             MenuItem(f"当前目标: {self.config['target']}", None, enabled=False),
@@ -367,10 +441,21 @@ class PingTrayMonitor:
         with self.config_lock:
             return self.config["target"]
 
-    def _set_target(self, value):
+    def _apply_settings(self, values):
+        """把设置对话框的结果写回 config.json 并立即生效。"""
         with self.config_lock:
-            self.config["target"] = value
+            changed = {key: value for key, value in values.items()
+                       if self.config.get(key) != value}
+            if not changed:
+                return  # 什么都没改，不必重写配置文件
+            self.config.update(changed)
             save_config(self.config)
+        # 目标/间隔/超时/阈值都是 Ping 循环逐轮读取的，下一轮自动生效（换目标时循环自己会
+        # 清空采样窗口），这里只需要处理挂件开关这种"立刻要变"的副作用。
+        if "show_in_taskbar" in changed:
+            widget = self.taskbar_widget
+            if widget is not None:
+                widget.set_enabled(changed["show_in_taskbar"])
 
     def _close_dialog(self):
         try:
@@ -380,7 +465,7 @@ class PingTrayMonitor:
             pass
         self._dialog = None
 
-    def _open_dialog(self, initial_value):
+    def _open_dialog(self, values):
         if self._dialog and self._dialog.winfo_exists():
             self._dialog.lift()
             self._dialog.focus_force()
@@ -388,7 +473,6 @@ class PingTrayMonitor:
 
         dlg = tk.Toplevel(self._tk_root)
         dlg.title("Ping Monitor - 设置")
-        dlg.geometry("340x170")
         dlg.resizable(False, False)
         dlg.attributes("-topmost", True)
 
@@ -397,44 +481,98 @@ class PingTrayMonitor:
 
         dlg.protocol("WM_DELETE_WINDOW", on_close)
 
-        tk.Label(dlg, text="目标地址 (IP或域名):").pack(pady=(20, 5))
+        form = tk.Frame(dlg, padx=18, pady=14)
+        form.pack(fill=tk.BOTH, expand=True)
+        form.columnconfigure(1, weight=1)
 
-        entry = tk.Entry(dlg, width=32)
-        entry.insert(0, initial_value)
-        entry.pack(pady=5, padx=20)
-        entry.focus_set()
-        entry.select_range(0, tk.END)
+        def add_label(text, row):
+            tk.Label(form, text=text, anchor="w").grid(
+                row=row, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
 
-        result = {"value": None}
+        thresholds = values.get("thresholds") or {}
+
+        add_label("目标地址 (IP 或域名):", 0)
+        target_entry = tk.Entry(form, width=24)
+        target_entry.insert(0, str(values.get("target", "")))
+        target_entry.grid(row=0, column=1, sticky="we", pady=(0, 8))
+
+        add_label("Ping 间隔 (秒):", 1)
+        interval_entry = tk.Entry(form, width=10)
+        interval_entry.insert(0, number_text(values.get("interval", 1)))
+        interval_entry.grid(row=1, column=1, sticky="w", pady=(0, 8))
+
+        add_label("超时时间 (秒):", 2)
+        timeout_entry = tk.Entry(form, width=10)
+        timeout_entry.insert(0, number_text(values.get("timeout", 2)))
+        timeout_entry.grid(row=2, column=1, sticky="w", pady=(0, 8))
+
+        add_label("颜色阈值 (毫秒):", 3)
+        threshold_frame = tk.Frame(form)
+        threshold_frame.grid(row=3, column=1, sticky="w", pady=(0, 8))
+        tk.Label(threshold_frame, text="绿 ≤").pack(side=tk.LEFT)
+        good_entry = tk.Entry(threshold_frame, width=7)
+        good_entry.insert(0, number_text(thresholds.get("good",
+                                                        DEFAULT_CONFIG["thresholds"]["good"])))
+        good_entry.pack(side=tk.LEFT, padx=(3, 12))
+        tk.Label(threshold_frame, text="黄 ≤").pack(side=tk.LEFT)
+        fair_entry = tk.Entry(threshold_frame, width=7)
+        fair_entry.insert(0, number_text(thresholds.get("fair",
+                                                        DEFAULT_CONFIG["thresholds"]["fair"])))
+        fair_entry.pack(side=tk.LEFT, padx=(3, 0))
+
+        tk.Label(form, text="超过黄色阈值的延迟显示为红色；超时/无响应显示 ×",
+                 anchor="w", fg="#666666").grid(row=4, column=0, columnspan=2,
+                                                sticky="w", pady=(0, 10))
+
+        show_taskbar = tk.BooleanVar(value=bool(values.get("show_in_taskbar", True)))
+        tk.Checkbutton(form, text="在任务栏显示数值挂件", variable=show_taskbar,
+                       anchor="w").grid(row=5, column=0, columnspan=2, sticky="w")
+
+        result = {"values": None}
 
         def on_save():
-            val = entry.get().strip()
-            if not val:
-                messagebox.showwarning("警告", "目标地址不能为空", parent=dlg)
+            parsed, error = parse_settings(target_entry.get(), interval_entry.get(),
+                                           timeout_entry.get(), good_entry.get(),
+                                           fair_entry.get(), show_taskbar.get())
+            if error:
+                messagebox.showwarning("提示", error, parent=dlg)
                 return
-            result["value"] = val
+            result["values"] = parsed
             on_close()
 
         def on_cancel():
-            result["value"] = initial_value
             on_close()
 
         btn_frame = tk.Frame(dlg)
-        btn_frame.pack(pady=10)
+        btn_frame.pack(pady=(0, 14))
         tk.Button(btn_frame, text="保存", command=on_save, width=10).pack(side=tk.LEFT, padx=5)
         tk.Button(btn_frame, text="取消", command=on_cancel, width=10).pack(side=tk.LEFT, padx=5)
+
+        dlg.bind("<Return>", lambda event: on_save())
+        dlg.bind("<Escape>", lambda event: on_cancel())
+
+        center_window(dlg)
+        target_entry.focus_set()
+        target_entry.select_range(0, tk.END)
 
         self._dialog = dlg
         dlg.wait_window(dlg)
 
-        if result["value"] is not None and result["value"] != initial_value:
-            self._set_target(result["value"])
+        if result["values"] is not None:
+            self._apply_settings(result["values"])
 
     def open_settings(self, icon=None, item=None):
         if not self._tk_root or not self._tk_root.winfo_exists():
             return
-        target = self._get_target()
-        self._tk_root.after(0, lambda: self._open_dialog(target))
+        with self.config_lock:
+            values = {
+                "target": self.config["target"],
+                "interval": self.config.get("interval", 1),
+                "timeout": self.config.get("timeout", 2),
+                "show_in_taskbar": bool(self.config.get("show_in_taskbar", True)),
+                "thresholds": dict(self.config.get("thresholds") or {}),
+            }
+        self._tk_root.after(0, lambda: self._open_dialog(values))
 
     def update_ping(self):
         history = deque(maxlen=SAMPLE_WINDOW)
@@ -464,7 +602,7 @@ class PingTrayMonitor:
 
             latency_text = status_text(state, latency, lost, total)
             self.icon.menu = Menu(
-                MenuItem("设置目标地址...", self.open_settings, default=True),
+                MenuItem("设置...", self.open_settings, default=True),
                 MenuItem("在任务栏显示数值", self.toggle_taskbar, checked=self._taskbar_checked),
                 MenuItem(Menu.SEPARATOR, None, enabled=False),
                 MenuItem(f"当前目标: {target}", None, enabled=False),

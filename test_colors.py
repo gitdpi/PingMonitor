@@ -300,5 +300,104 @@ class PaletteTests(unittest.TestCase):
             m.taskbar_is_light = original
 
 
+class SettingsParseTests(unittest.TestCase):
+    def test_valid_input(self):
+        values, error = m.parse_settings("1.1.1.1", "1", "2", "80", "150", True)
+        self.assertIsNone(error)
+        self.assertEqual(values, {
+            "target": "1.1.1.1",
+            "interval": 1,
+            "timeout": 2,
+            "show_in_taskbar": True,
+            "thresholds": {"good": 80.0, "fair": 150.0},
+        })
+
+    def test_target_is_trimmed_and_checkbox_kept(self):
+        values, error = m.parse_settings("  baidu.com  ", "1", "2", "80", "150", False)
+        self.assertIsNone(error)
+        self.assertEqual(values["target"], "baidu.com")
+        self.assertIs(values["show_in_taskbar"], False)
+
+    def test_empty_target(self):
+        values, error = m.parse_settings("   ", "1", "2", "80", "150", True)
+        self.assertIsNone(values)
+        self.assertIn("不能为空", error)
+
+    def test_non_numeric_field(self):
+        for index, args in enumerate((
+                ("abc", "2", "80", "150"),
+                ("1", "abc", "80", "150"),
+                ("1", "2", "abc", "150"),
+                ("1", "2", "80", "abc"))):
+            with self.subTest(field=index):
+                values, error = m.parse_settings("1.1.1.1", *args, True)
+                self.assertIsNone(values)
+                self.assertIn("必须是数字", error)
+
+    def test_non_finite_is_rejected(self):
+        for text in ("nan", "inf", "-inf"):
+            with self.subTest(text=text):
+                values, error = m.parse_settings("1.1.1.1", text, "2", "80", "150", True)
+                self.assertIsNone(values)
+                self.assertIn("有限的数字", error)
+
+    def test_interval_lower_bound(self):
+        values, error = m.parse_settings("1.1.1.1", "0.1", "2", "80", "150", True)
+        self.assertIsNone(values)
+        self.assertIn("不能小于", error)
+        values, error = m.parse_settings("1.1.1.1", "0.2", "2", "80", "150", True)
+        self.assertIsNone(error)
+        self.assertEqual(values["interval"], 0.2)
+
+    def test_timeout_must_be_positive(self):
+        values, error = m.parse_settings("1.1.1.1", "1", "0", "80", "150", True)
+        self.assertIsNone(values)
+        self.assertIn("必须大于 0", error)
+
+    def test_threshold_must_be_positive(self):
+        values, error = m.parse_settings("1.1.1.1", "1", "2", "0", "150", True)
+        self.assertIsNone(values)
+        self.assertIn("必须是正数", error)
+
+    def test_green_must_be_below_yellow(self):
+        for good, fair in (("150", "80"), ("100", "100")):
+            with self.subTest(good=good, fair=fair):
+                values, error = m.parse_settings("1.1.1.1", "1", "2", good, fair, True)
+                self.assertIsNone(values)
+                self.assertIn("小于黄色阈值", error)
+
+    def test_integral_numbers_are_stored_as_int(self):
+        values, _ = m.parse_settings("1.1.1.1", "2.0", "3.0", "80.0", "150.0", True)
+        self.assertIsInstance(values["interval"], int)
+        self.assertIsInstance(values["timeout"], int)
+        self.assertEqual((values["interval"], values["timeout"]), (2, 3))
+
+
+class NumberTextTests(unittest.TestCase):
+    def test_integral_values_render_without_decimal(self):
+        self.assertEqual(m.number_text(1.0), "1")
+        self.assertEqual(m.number_text(80), "80")
+
+    def test_fraction_keeps_decimal(self):
+        self.assertEqual(m.number_text(0.5), "0.5")
+        self.assertEqual(m.number_text(2.25), "2.25")
+
+    def test_tidy_number(self):
+        self.assertEqual(m.tidy_number(1.0), 1)
+        self.assertIsInstance(m.tidy_number(1.0), int)
+        self.assertEqual(m.tidy_number(0.5), 0.5)
+
+
+class CenterGeometryTests(unittest.TestCase):
+    def test_centers_window(self):
+        self.assertEqual(m.center_geometry((1920, 1080), (360, 260)), "360x260+780+410")
+
+    def test_odd_difference_floors(self):
+        self.assertEqual(m.center_geometry((1000, 1000), (101, 101)), "101x101+449+449")
+
+    def test_never_goes_negative(self):
+        self.assertEqual(m.center_geometry((800, 600), (900, 700)), "900x700+0+0")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
